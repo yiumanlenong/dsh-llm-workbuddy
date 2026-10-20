@@ -44,7 +44,9 @@ const EXPIRY_FIELDS = [
 ];
 const LABEL_FIELDS = ["PackageName", "PackageTypeName", "AccountName", "ProductName", "Name", "RuleName", "Description"];
 const MAX_USAGE_PAGES = 100;
-const PAGE_SIZE = 100;
+// The usage endpoint accepts large page sizes and caps the response at the day's total, so one
+// request normally covers a full day instead of one round trip per 100 requests.
+const PAGE_SIZE = 1000;
 
 function normalizeHost(value) {
   const fallback = new URL(DEFAULT_BILLING_HOST);
@@ -395,35 +397,38 @@ async function retry(task, attempts = 2) {
 export async function fetchWorkBuddyCredits(session, options = {}) {
   const host = billingHost(session);
   const account = session?.account && typeof session.account === "object" ? session.account : {};
-  let creditResult;
-  let creditError = null;
-  try {
-    const enterpriseId = typeof account.enterpriseId === "string" ? account.enterpriseId.trim() : "";
-    const enterpriseEdition = typeof account.type === "string" && ENTERPRISE_EDITIONS.has(account.type.toLowerCase());
-    if (enterpriseId || enterpriseEdition) {
-      const resolvedId = enterpriseId || await retry(() => resolveEnterpriseId(session, host, options));
-      if (!resolvedId) throw new Error("企业账号缺少 enterpriseId");
-      creditResult = await retry(() => queryEnterpriseCredits(session, host, resolvedId, options));
-    } else {
-      creditResult = await retry(() => queryPersonalCredits(session, host, options));
+  const loadCredits = async () => {
+    try {
+      const enterpriseId = typeof account.enterpriseId === "string" ? account.enterpriseId.trim() : "";
+      const enterpriseEdition = typeof account.type === "string" && ENTERPRISE_EDITIONS.has(account.type.toLowerCase());
+      if (enterpriseId || enterpriseEdition) {
+        const resolvedId = enterpriseId || await retry(() => resolveEnterpriseId(session, host, options));
+        if (!resolvedId) throw new Error("企业账号缺少 enterpriseId");
+        return { result: await retry(() => queryEnterpriseCredits(session, host, resolvedId, options)), error: null };
+      }
+      return { result: await retry(() => queryPersonalCredits(session, host, options)), error: null };
+    } catch (error) {
+      return {
+        result: { credits: null, count: 0, totalDosage: null, segments: [], unlimited: false, cycleResetTime: null },
+        error: error instanceof Error ? error.message : String(error),
+      };
     }
-  } catch (error) {
-    creditError = error instanceof Error ? error.message : String(error);
-    creditResult = { credits: null, count: 0, totalDosage: null, segments: [], unlimited: false, cycleResetTime: null };
-  }
-
-  let todayUsage;
-  let todayUsageError = null;
-  try {
-    todayUsage = await retry(() => queryTodayUsage(session, host, options));
-  } catch (error) {
-    todayUsageError = error instanceof Error ? error.message : String(error);
-  }
+  };
+  const loadTodayUsage = async () => {
+    try {
+      return { result: await retry(() => queryTodayUsage(session, host, options)), error: null };
+    } catch (error) {
+      return { result: null, error: error instanceof Error ? error.message : String(error) };
+    }
+  };
+  // Both queries are independent account reads; overlapping them keeps the dock from waiting
+  // for the credit balance before the usage pages even start.
+  const [credit, today] = await Promise.all([loadCredits(), loadTodayUsage()]);
   return {
-    ...creditResult,
-    creditError,
-    todayUsage: todayUsage ?? null,
-    todayUsageError,
+    ...credit.result,
+    creditError: credit.error,
+    todayUsage: today.result,
+    todayUsageError: today.error,
   };
 }
 

@@ -369,6 +369,8 @@ test("客户端兼容包装 Provider 并将 WorkBuddy 用量并入统计行", ()
   assert.match(client, /window\.confirm/);
   assert.match(client, /sessionId/);
   assert.match(client, /const hasTokenAccount = state\?\.mode === "token"/);
+  assert.match(client, /previous && previous\.activeAccountId/);
+  assert.match(client, /const loading = Boolean\(state\?\.creditLoading\)/);
   assert.match(client, /state\.routingEnabled && sessionId \? createElement/);
   assert.match(client, /const seats = Array\.from\(document\.querySelectorAll\("\[data-composer-seat\]"\)\)/);
   assert.match(client, /for \(const panel of panels\) panel\.remove\(\)/);
@@ -749,6 +751,84 @@ test("企业积分响应支持不限量和周期重置时间", () => {
   assert.equal(result.unlimited, true);
   assert.equal(result.credits, null);
   assert.ok(Number.isFinite(result.cycleResetTime));
+});
+
+test("积分与今日用量并发查询，不互相等待", async () => {
+  const originalFetch = globalThis.fetch;
+  const order = [];
+  let creditResolve;
+  const creditGate = new Promise((resolve) => { creditResolve = resolve; });
+  globalThis.fetch = async (url) => {
+    const target = String(url);
+    if (target.includes("get-user-resource")) {
+      order.push("credits:start");
+      await creditGate;
+      order.push("credits:end");
+      return new Response(JSON.stringify({ code: 0, data: { Response: { Data: { Accounts: [{ CapacityRemain: 10 }] } } } }), { status: 200 });
+    }
+    order.push("usage:start");
+    creditResolve();
+    return new Response(JSON.stringify({ code: 0, data: { total: 1, data: [{ requestTime: Date.now(), credit: 1 }] } }), { status: 200 });
+  };
+  try {
+    const result = await fetchWorkBuddyCredits({ auth: { accessToken: "token" }, account: { userId: "user" } });
+    assert.equal(result.credits, 10);
+    assert.equal(result.todayUsage.count, 1);
+    // Usage must start before the credit request finishes, otherwise the two calls are serialized.
+    assert.deepEqual(order, ["credits:start", "usage:start", "credits:end"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("今日用量默认单页取全天，只有真分页时才继续翻页", async () => {
+  const originalFetch = globalThis.fetch;
+  const bodies = [];
+  const rows = Array.from({ length: 640 }, (_, index) => ({ requestTime: Date.now() - index * 1000, credit: 0.5 }));
+  globalThis.fetch = async (url, options) => {
+    const body = JSON.parse(options.body);
+    bodies.push(body);
+    if (String(url).includes("get-user-resource")) {
+      return new Response(JSON.stringify({ code: 0, data: { Response: { Data: { Accounts: [{ CapacityRemain: 1 }] } } } }), { status: 200 });
+    }
+    return new Response(JSON.stringify({ code: 0, data: { total: rows.length, data: rows } }), { status: 200 });
+  };
+  try {
+    const result = await fetchWorkBuddyCredits({ auth: { accessToken: "token" }, account: { userId: "user" } });
+    assert.equal(bodies.filter((body) => "pageNum" in body).length, 1);
+    assert.ok(bodies.find((body) => "pageNum" in body).pageSize >= rows.length);
+    assert.equal(result.todayUsage.count, rows.length);
+    assert.equal(result.todayUsage.used, 320);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("单页装不下全天时继续翻页并累计全部请求", async () => {
+  const originalFetch = globalThis.fetch;
+  const bodies = [];
+  const pageSize = 1000;
+  const total = 2500;
+  globalThis.fetch = async (url, options) => {
+    const body = JSON.parse(options.body);
+    bodies.push(body);
+    if (String(url).includes("get-user-resource")) {
+      return new Response(JSON.stringify({ code: 0, data: { Response: { Data: { Accounts: [{ CapacityRemain: 1 }] } } } }), { status: 200 });
+    }
+    const start = (body.pageNum - 1) * body.pageSize;
+    const rows = Array.from({ length: Math.min(body.pageSize, total - start) }, () => ({ requestTime: Date.now(), credit: 1 }));
+    bodies.at(-1).returned = rows.length;
+    return new Response(JSON.stringify({ code: 0, data: { total, data: rows } }), { status: 200 });
+  };
+  try {
+    const result = await fetchWorkBuddyCredits({ auth: { accessToken: "token" }, account: { userId: "user" } });
+    assert.equal(result.todayUsage.count, total);
+    assert.equal(result.todayUsage.used, total);
+    assert.equal(bodies.find((body) => "pageNum" in body).pageSize, pageSize);
+    assert.deepEqual(bodies.filter((body) => "pageNum" in body).map((body) => body.pageNum), [1, 2, 3]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("积分查询只接受受信任的 WorkBuddy billing 域名", () => {

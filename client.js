@@ -396,7 +396,9 @@ window.__ModuleLoader__.load({
             setState(null);
             return;
           }
-          setState({ mode: "token", creditLoading: true, credits: undefined, todayUsage: null, creditError: null, todayUsageError: null });
+          setState((previous) => previous && previous.activeAccountId
+            ? { ...previous, creditLoading: true, creditError: null, todayUsageError: null }
+            : { mode: "token", creditLoading: true, credits: undefined, todayUsage: null, creditError: null, todayUsageError: null });
           let status;
           try {
             status = await authRequest("status", undefined, sessionId);
@@ -438,7 +440,11 @@ window.__ModuleLoader__.load({
       }, [provider, selected, sessionId]);
 
       const hasTokenAccount = state?.mode === "token" && Boolean(state.activeAccountId);
-      if (!selected || !state || (!state.routingEnabled && state.mode !== "token") || (!state.routingEnabled && state.mode === "token" && !state.activeAccountId) || (!sessionId && !hasTokenAccount)) return null;
+      // Keep the dock mounted while a refresh is in flight, even before the account id is known, so
+      // the "读取中…" placeholders show instead of the row disappearing on every 60s poll.
+      const loading = Boolean(state?.creditLoading);
+      const credentialsHidden = !state?.routingEnabled && (state?.mode !== "token" || !state?.activeAccountId);
+      if (!selected || !state || (!loading && credentialsHidden) || (!sessionId && !hasTokenAccount)) return null;
       const creditsText = state.creditLoading
         ? "剩余积分：读取中…"
         : state.unlimited
